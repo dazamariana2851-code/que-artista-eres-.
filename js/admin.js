@@ -756,8 +756,21 @@ document.addEventListener("DOMContentLoaded", () => {
   if (adminRoot) {
     window.StorageService.init();
     window.AdminDashboard.render(adminRoot);
-    window.addEventListener("storage", () => {
-      window.AdminDashboard.render(adminRoot);
+    window.StorageService.subscribe(() => {
+      if (window.AdminDashboard.isAuthenticated) {
+        const activeId = document.activeElement?.id;
+        const cursorPos = document.activeElement?.selectionStart;
+        window.AdminDashboard.render(adminRoot);
+        if (activeId === "admin-table-search") {
+          const input = adminRoot.querySelector("#admin-table-search");
+          if (input) {
+            input.focus();
+            if (typeof cursorPos === "number") {
+              input.setSelectionRange(cursorPos, cursorPos);
+            }
+          }
+        }
+      }
     });
   }
 });

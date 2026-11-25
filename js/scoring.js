@@ -139,64 +139,179 @@ window.ScoringEngine = {
   }
 };
 
+// Inicialización de Firebase Firestore (Modo Compat por CDN)
+const firebaseConfig = {
+  apiKey: "AIzaSyCJoio4tZL5wdpIGe7y8EV3kXqjRpqhj_w",
+  authDomain: "reflejo-creativo.firebaseapp.com",
+  projectId: "reflejo-creativo",
+  storageBucket: "reflejo-creativo.firebasestorage.app",
+  messagingSenderId: "841627313484",
+  appId: "1:841627313484:web:9f634c32f2a9f3ee805be9",
+  measurementId: "G-HGGKGGEMD4"
+};
+
+let firestoreDb = null;
+try {
+  if (typeof firebase !== "undefined") {
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    firestoreDb = firebase.firestore();
+  }
+} catch (err) {
+  console.error("Error inicializando Firebase:", err);
+}
+
 window.StorageService = {
-  STORAGE_KEY: "reflejo_creativo_real_submissions",
-  QR_SCANS_KEY: "reflejo_creativo_real_qr_scans",
+  COLLECTION_NAME: "submissions",
+  STATS_COLLECTION: "metadata",
+  STATS_DOC: "stats",
+  submissionsCache: [],
+  qrScansCache: 0,
+  isListening: false,
+  listeners: [],
 
   init() {
-    // Limpiar cualquier clave antigua que tuviera datos semilla ficticios
-    localStorage.removeItem("reflejo_creativo_submissions_v2");
-    localStorage.removeItem("reflejo_creativo_qr_scans_v2");
+    if (!firestoreDb) return this.submissionsCache;
 
-    let existing = [];
-    try {
-      const raw = localStorage.getItem(this.STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          // Filtrar por seguridad cualquier registro ficticio si existiera
-          existing = parsed.filter(
-            (item) => item && item.id && !String(item.id).startsWith("rc-2026-") && !String(item.id).startsWith("rc-live-")
-          );
-        }
-      }
-    } catch (e) {
-      existing = [];
+    if (!this.isListening) {
+      this.isListening = true;
+
+      // Escuchar en tiempo real todos los participantes desde Firestore
+      firestoreDb
+        .collection(this.COLLECTION_NAME)
+        .onSnapshot(
+          (snapshot) => {
+            const docs = [];
+            snapshot.forEach((doc) => {
+              const data = doc.data();
+              if (data) {
+                docs.push({
+                  ...data,
+                  id: data.id || doc.id
+                });
+              }
+            });
+            // Ordenar del más reciente al más antiguo por created_at
+            docs.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+            this.submissionsCache = docs;
+            this.notifyListeners();
+          },
+          (error) => {
+            console.error("Error escuchando colección submissions en Firestore:", error);
+          }
+        );
+
+      // Escuchar en tiempo real el contador de inicios/escaneos QR
+      firestoreDb
+        .collection(this.STATS_COLLECTION)
+        .doc(this.STATS_DOC)
+        .onSnapshot(
+          (doc) => {
+            if (doc.exists) {
+              const data = doc.data();
+              this.qrScansCache = Number(data?.qr_scans || 0);
+              this.notifyListeners();
+            }
+          },
+          (error) => {
+            console.error("Error escuchando stats en Firestore:", error);
+          }
+        );
     }
 
-    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(existing));
-    return existing;
+    return this.submissionsCache;
+  },
+
+  subscribe(callback) {
+    if (typeof callback === "function" && !this.listeners.includes(callback)) {
+      this.listeners.push(callback);
+    }
+  },
+
+  notifyListeners() {
+    this.listeners.forEach((cb) => {
+      try {
+        cb(this.submissionsCache);
+      } catch (e) {
+        console.error(e);
+      }
+    });
   },
 
   getAllSubmissions() {
-    return this.init();
+    this.init();
+    return this.submissionsCache;
   },
 
   recordQrScan() {
-    const current = Number(localStorage.getItem(this.QR_SCANS_KEY) || 0);
-    localStorage.setItem(this.QR_SCANS_KEY, String(current + 1));
+    this.qrScansCache += 1;
+    if (!firestoreDb) return;
+
+    firestoreDb
+      .collection(this.STATS_COLLECTION)
+      .doc(this.STATS_DOC)
+      .set(
+        {
+          qr_scans: firebase.firestore.FieldValue.increment(1),
+          updated_at: new Date().toISOString()
+        },
+        { merge: true }
+      )
+      .catch((err) => {
+        console.error("Error registrando inicio de test en Firestore:", err);
+      });
   },
 
   getTotalQrScans() {
-    const subs = this.getAllSubmissions().length;
-    const stored = Number(localStorage.getItem(this.QR_SCANS_KEY) || 0);
-    return Math.max(stored, subs);
+    const subs = this.submissionsCache.length;
+    return Math.max(this.qrScansCache, subs);
   },
 
   saveSubmission(submission) {
-    const list = this.getAllSubmissions();
-    list.unshift(submission);
-    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(list));
+    // Actualizar caché en memoria de inmediato
+    const existsIdx = this.submissionsCache.findIndex((s) => s.id === submission.id);
+    if (existsIdx >= 0) {
+      this.submissionsCache[existsIdx] = submission;
+    } else {
+      this.submissionsCache.unshift(submission);
+    }
+
+    if (firestoreDb) {
+      firestoreDb
+        .collection(this.COLLECTION_NAME)
+        .doc(String(submission.id))
+        .set(submission)
+        .catch((err) => {
+          console.error("Error guardando resultado en Firestore:", err);
+        });
+    }
+
     return submission;
   },
 
   markSharedOrDownloaded(submissionId) {
     if (!submissionId) return;
-    const list = this.getAllSubmissions();
-    const target = list.find((s) => s.id === submissionId);
+    const target = this.submissionsCache.find((s) => s.id === submissionId);
     if (target && target.telemetry_hidden) {
       target.telemetry_hidden.shared_or_downloaded = true;
-      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(list));
+    }
+
+    if (firestoreDb) {
+      firestoreDb
+        .collection(this.COLLECTION_NAME)
+        .doc(String(submissionId))
+        .set(
+          {
+            telemetry_hidden: {
+              shared_or_downloaded: true
+            }
+          },
+          { merge: true }
+        )
+        .catch((err) => {
+          console.error("Error actualizando estado compartido en Firestore:", err);
+        });
     }
   },
 
